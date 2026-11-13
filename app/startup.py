@@ -1,5 +1,7 @@
-from app.db.init_db import run_init_db
 import os
+import threading
+from app.db.init_db import run_init_db
+
 
 def run_startup_tasks():
     run_init_db()
@@ -20,9 +22,19 @@ def run_startup_tasks():
         else:
             log_event("init", "⚠️ Skipping exclusions playlist check. No SPOTIFY_REFRESH_TOKEN found.")
 
-    except Exception as e:
+    except Exception:
         import traceback
-        print("⚠️ Error during exclusions playlist check:")
+        print("⚠️ Error during exclusions playlist check:", flush=True)
         traceback.print_exc()
 
-run_startup_tasks()
+
+def _run_in_background():
+    try:
+        run_startup_tasks()
+    except Exception as e:
+        print(f"❌ Startup tasks failed: {e}", flush=True)
+
+
+# Se ejecuta en un hilo aparte para que el servidor web abra el puerto
+# de inmediato y Render no marque el deploy como fallido.
+threading.Thread(target=_run_in_background, daemon=True).start()
