@@ -377,14 +377,41 @@ CROSS JOIN LATERAL (
 ) AS combined_dates
 ;
 """
-
+UNIFIED_PLAYS_VIEW = """
+CREATE MATERIALIZED VIEW unified_plays_mv AS
+WITH raw_plays AS (
+    SELECT track_id, track_name, artist_id, artist_name, album_id, album_name, album_type, duration_ms, played_at
+    FROM plays
+    UNION
+    SELECT track_id, track_name, artist_id, artist_name, album_id, album_name, album_type, duration_ms, played_at
+    FROM spotify_play_history
+    UNION
+    SELECT track_id, track_name, artist_id, artist_name, album_id, album_name, album_type, duration_ms, played_at
+    FROM apple_music_play_history
+)
+SELECT
+    COALESCE(eq.canonical_track_id, rp.track_id) AS track_id,
+    rp.track_name,
+    rp.artist_id,
+    rp.artist_name,
+    rp.album_id,
+    rp.album_name,
+    rp.album_type,
+    rp.duration_ms,
+    rp.played_at
+FROM raw_plays rp
+LEFT JOIN track_id_equivalents eq
+  ON eq.alias_track_id = rp.track_id;
+"""
 if __name__ == "__main__":
     log_event("build_unified_tracks", "Starting unified_tracks materialized view build...")
     conn = get_db_connection()
     cur = conn.cursor()
     # Force drop and recreate the materialized view each run
     cur.execute("DROP MATERIALIZED VIEW IF EXISTS unified_tracks;")
-    cur.execute(UNIFIED_TRACKS_VIEW)
+    cur.execute("DROP MATERIALIZED VIEW IF EXISTS unified_plays_mv;")
+   cur.execute(UNIFIED_PLAYS_VIEW)
+   cur.execute(UNIFIED_TRACKS_VIEW)
     conn.commit()
     log_event("build_unified_tracks", "Recreated unified_tracks MV.")
 
@@ -432,3 +459,4 @@ if __name__ == "__main__":
     log_event("build_unified_tracks", f"✅ unified_tracks view built successfully with {row_count} rows.")
     cur.close()
     conn.close()
+“fix: crear unified_plays_mv antes de unified_tracks”
