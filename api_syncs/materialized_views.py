@@ -2,14 +2,37 @@ import os
 from utils.logger import log_event
 from utils.db_utils import get_db_connection
 
-UNIFIED_TRACKS_VIEW = """
-DROP MATERIALIZED VIEW IF EXISTS unified_tracks;
+UNIFIED_PLAYS_VIEW = """
+CREATE MATERIALIZED VIEW unified_plays_mv AS
+WITH raw_plays AS (
+    SELECT track_id, track_name, artist_id, artist_name, album_id, album_name, album_type, duration_ms, played_at
+    FROM plays
+    UNION
+    SELECT track_id, track_name, artist_id, artist_name, album_id, album_name, album_type, duration_ms, played_at
+    FROM spotify_play_history
+    UNION
+    SELECT track_id, track_name, artist_id, artist_name, album_id, album_name, album_type, duration_ms, played_at
+    FROM apple_music_play_history
+)
+SELECT
+    COALESCE(eq.canonical_track_id, rp.track_id) AS track_id,
+    rp.track_name,
+    rp.artist_id,
+    rp.artist_name,
+    rp.album_id,
+    rp.album_name,
+    rp.album_type,
+    rp.duration_ms,
+    rp.played_at
+FROM raw_plays rp
+LEFT JOIN track_id_equivalents eq
+  ON eq.alias_track_id = rp.track_id;
+"""
 
+UNIFIED_TRACKS_VIEW = """
 CREATE MATERIALIZED VIEW unified_tracks AS
--- Step 0: Use unified_plays_mv (canonicalized track_id via track_id_equivalents)
 WITH all_plays AS (
     SELECT
-        -- unified_plays_mv has no stable source id; generate a deterministic row id for internal matching
         ROW_NUMBER() OVER (
             ORDER BY
                 played_at,
@@ -33,7 +56,6 @@ WITH all_plays AS (
       AND track_id IS NOT NULL
 ),
 
--- Step 1a: Canonicalize track IDs for tracks and liked_tracks using track_id_equivalents
 tracks_canon_raw AS (
     SELECT
         t.*,
@@ -43,8 +65,6 @@ tracks_canon_raw AS (
       ON eq.alias_track_id = t.id
 ),
 tracks_canon AS (
-    -- One row per canonical_track_id.
-    -- Prefer the true canonical row (id == canonical_track_id), then most recent added_at.
     SELECT DISTINCT ON (canonical_track_id)
         *
     FROM tracks_canon_raw
@@ -62,8 +82,6 @@ liked_tracks_canon_raw AS (
       ON eq.alias_track_id = lt.track_id
 ),
 liked_tracks_canon AS (
-    -- One row per canonical_track_id.
-    -- Prefer a like that already matches the canonical id, then most recent liked_at.
     SELECT DISTINCT ON (canonical_track_id)
         *
     FROM liked_tracks_canon_raw
@@ -73,7 +91,6 @@ liked_tracks_canon AS (
         liked_at DESC NULLS LAST
 ),
 
--- Step 1b: Merge tracks and liked_tracks into a unified base (library source), keyed by canonical track_id
 base_tracks AS (
     SELECT
         tc.canonical_track_id AS track_id,
@@ -84,18 +101,18 @@ base_tracks AS (
         a.name AS album_name,
         a.album_type,
         a.album_image_url,
-        a.release_date::text AS release_date,         -- cast to text
+        a.release_date::text AS release_date,
         ar.genres,
         ar.image_url AS artist_image,
         tc.track_number,
         COALESCE(tc.disc_number, 1) AS disc_number,
-        tc.added_at,                                    -- timestamptz
+        tc.added_at,
         tc.added_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' AS added_at_est,
         tc.duration_ms,
         COALESCE(ltc.popularity, tc.popularity) AS popularity,
-        ltc.liked_at,                                   -- timestamptz
+        ltc.liked_at,
         ltc.liked_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' AS liked_at_est,
-        ltc.last_checked_at,                            -- timestamptz
+        ltc.last_checked_at,
         ta.is_playable,
         CASE WHEN ltc.liked_at IS NOT NULL THEN TRUE ELSE FALSE END AS is_liked,
         EXISTS (
@@ -149,7 +166,6 @@ base_tracks AS (
     WHERE tc.id IS NULL
 ),
 
--- Step 2: Aggregate play stats from exact track_id matches (library + non-library)
 play_stats AS (
     SELECT
         track_id,
@@ -160,7 +176,6 @@ play_stats AS (
     GROUP BY track_id
 ),
 
--- Step 3: Classify skips and resumes from plays (fallback to plays.duration_ms)
 classified_plays AS (
     SELECT
         p.track_id,
@@ -186,7 +201,6 @@ classified_plays AS (
     LEFT JOIN liked_tracks_canon ltc ON ltc.canonical_track_id = p.track_id
 ),
 
--- Step 4: Aggregate resume/skip counts
 play_behavior_stats AS (
     SELECT
         track_id,
@@ -196,7 +210,6 @@ play_behavior_stats AS (
     GROUP BY track_id
 ),
 
--- Step 5: Narrow to fuzzy candidates (no exact id in library/liked)
 fuzzy_candidates AS (
   SELECT p.*
   FROM all_plays p
@@ -207,9 +220,8 @@ fuzzy_candidates AS (
     AND ltc.track_id IS NULL
 ),
 
--- Step 6: Fuzzy match only those candidates
 fuzzy_matched_tracks AS (
-  SELECT 
+  SELECT
     c.play_row_id AS play_id,
     t.id        AS matched_track_id,
     c.played_at AS fuzzy_played_at
@@ -220,7 +232,6 @@ fuzzy_matched_tracks AS (
    AND ABS(COALESCE(c.duration_ms, 0) - COALESCE(t.duration_ms, 0)) <= 1000
 ),
 
--- Step 7: Aggregate fuzzy match stats
 fuzzy_play_stats AS (
   SELECT
     matched_track_id AS track_id,
@@ -231,7 +242,6 @@ fuzzy_play_stats AS (
   GROUP BY matched_track_id
 ),
 
--- Step 8: Identify non-library track_ids from plays not in library/liked AND not used by a fuzzy match play
 non_library_candidates AS (
     SELECT
         p.track_id
@@ -243,7 +253,6 @@ non_library_candidates AS (
     GROUP BY p.track_id
 ),
 
--- Step 9: Pick the most recent play per track once (avoid per-row sorts)
 latest_play_per_track AS (
     SELECT DISTINCT ON (p.track_id)
         p.*
@@ -252,7 +261,6 @@ latest_play_per_track AS (
     ORDER BY p.track_id, p.played_at DESC
 ),
 
--- Step 10: For each candidate, pick a representative (most recent play) and enrich if available
 non_library_base AS (
     SELECT
         p.track_id,
@@ -287,7 +295,6 @@ non_library_base AS (
     LEFT JOIN track_availability ta ON ta.track_id = p.track_id
 ),
 
--- Step 11: Combine library and non-library rows before stats joins
 all_base AS (
     SELECT * FROM base_tracks
     UNION ALL
@@ -330,7 +337,6 @@ SELECT
     fp.fuzz_play_count_first_played,
     fp.fuzz_play_count_last_played,
 
-    -- Combined logic
     GREATEST(
       COALESCE(ps.library_play_count, 0) +
       COALESCE(fp.fuzz_play_count, 0) -
@@ -377,74 +383,42 @@ CROSS JOIN LATERAL (
 ) AS combined_dates
 ;
 """
-UNIFIED_PLAYS_VIEW = """
-CREATE MATERIALIZED VIEW unified_plays_mv AS
-WITH raw_plays AS (
-    SELECT track_id, track_name, artist_id, artist_name, album_id, album_name, album_type, duration_ms, played_at
-    FROM plays
-    UNION
-    SELECT track_id, track_name, artist_id, artist_name, album_id, album_name, album_type, duration_ms, played_at
-    FROM spotify_play_history
-    UNION
-    SELECT track_id, track_name, artist_id, artist_name, album_id, album_name, album_type, duration_ms, played_at
-    FROM apple_music_play_history
-)
-SELECT
-    COALESCE(eq.canonical_track_id, rp.track_id) AS track_id,
-    rp.track_name,
-    rp.artist_id,
-    rp.artist_name,
-    rp.album_id,
-    rp.album_name,
-    rp.album_type,
-    rp.duration_ms,
-    rp.played_at
-FROM raw_plays rp
-LEFT JOIN track_id_equivalents eq
-  ON eq.alias_track_id = rp.track_id;
-"""
+
+
 if __name__ == "__main__":
     log_event("build_unified_tracks", "Starting unified_tracks materialized view build...")
     conn = get_db_connection()
     cur = conn.cursor()
-    # Force drop and recreate the materialized view each run
+
+    # Force drop and recreate the materialized views each run (order matters: tracks depends on plays)
     cur.execute("DROP MATERIALIZED VIEW IF EXISTS unified_tracks;")
     cur.execute("DROP MATERIALIZED VIEW IF EXISTS unified_plays_mv;")
-   cur.execute(UNIFIED_PLAYS_VIEW)
-   cur.execute(UNIFIED_TRACKS_VIEW)
+    cur.execute(UNIFIED_PLAYS_VIEW)
+    cur.execute(UNIFIED_TRACKS_VIEW)
     conn.commit()
-    log_event("build_unified_tracks", "Recreated unified_tracks MV.")
+    log_event("build_unified_tracks", "Recreated unified_plays_mv and unified_tracks MVs.")
 
-    # Ensure helpful indexes exist on the materialized view
+    # Indexes on the materialized view
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_unified_tracks_track_id     ON unified_tracks(track_id);
         CREATE INDEX IF NOT EXISTS idx_unified_tracks_artist       ON unified_tracks(artist);
         CREATE INDEX IF NOT EXISTS idx_unified_tracks_album_id     ON unified_tracks(album_id);
         CREATE INDEX IF NOT EXISTS idx_unified_tracks_last_played  ON unified_tracks(last_played_at);
-        -- accelerates the final ORDER BY for browsing
         CREATE INDEX IF NOT EXISTS idx_unified_tracks_browse_order ON unified_tracks(artist, album_id, disc_number, track_number);
         """
     )
-    conn.commit()
-
-    # Ensure helpful indexes exist on source tables used by the view
     cur.execute(
         """
-        -- Plays & history: speed grouping/windowing and candidate scans
         CREATE INDEX IF NOT EXISTS idx_unified_plays_track_time ON unified_plays_mv(track_id, played_at);
         CREATE INDEX IF NOT EXISTS idx_unified_plays_name_artist_lower ON unified_plays_mv(LOWER(track_name), LOWER(artist_name));
         CREATE INDEX IF NOT EXISTS idx_plays_track_time        ON plays(track_id, played_at);
         CREATE INDEX IF NOT EXISTS idx_hist_track_time         ON spotify_play_history(track_id, played_at);
         CREATE INDEX IF NOT EXISTS idx_amph_track_time         ON apple_music_play_history(track_id, played_at);
-
-        -- Functional indexes for fuzzy matching
         CREATE INDEX IF NOT EXISTS idx_plays_name_artist_lower ON plays(LOWER(track_name), LOWER(artist_name));
         CREATE INDEX IF NOT EXISTS idx_hist_name_artist_lower  ON spotify_play_history(LOWER(track_name), LOWER(artist_name));
         CREATE INDEX IF NOT EXISTS idx_amph_name_artist_lower  ON apple_music_play_history(LOWER(track_name), LOWER(artist_name));
         CREATE INDEX IF NOT EXISTS idx_tracks_name_artist_lower ON tracks(LOWER(name), LOWER(artist));
-
-        -- Common FK/lookup helpers
         CREATE INDEX IF NOT EXISTS idx_tracks_album            ON tracks(album_id);
         CREATE INDEX IF NOT EXISTS idx_liked_tracks_track      ON liked_tracks(track_id);
         CREATE INDEX IF NOT EXISTS idx_albums_id               ON albums(id);
@@ -459,4 +433,3 @@ if __name__ == "__main__":
     log_event("build_unified_tracks", f"✅ unified_tracks view built successfully with {row_count} rows.")
     cur.close()
     conn.close()
-“fix: crear unified_plays_mv antes de unified_tracks”
