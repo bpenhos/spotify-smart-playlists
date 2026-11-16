@@ -1,16 +1,32 @@
 import sys
 import time
 import requests.exceptions
+from spotipy import Spotify
 from spotipy.exceptions import SpotifyException
 from utils.logger import log_event
 from utils.spotify_auth import get_spotify_client
 from utils.db_utils import get_db_connection
 
-sp = get_spotify_client()
+# Cliente sin reintentos internos de spotipy: si Spotify pide esperar,
+# el error sale de inmediato en vez de dormir el proceso horas.
+_base_client = get_spotify_client()
+sp = Spotify(
+    auth_manager=_base_client.auth_manager,
+    retries=0,
+    status_retries=0,
+    requests_timeout=15,
+)
 
 # Si Spotify pide esperar más de este número de segundos, la ejecución se detiene limpiamente.
-# Lo ya guardado se conserva y la siguiente ejecución continúa desde donde quedó.
 MAX_WAIT_SECONDS = 120
+
+
+def _retry_after_seconds(e):
+    headers = getattr(e, "headers", None) or {}
+    try:
+        return int(headers.get("Retry-After", 5))
+    except (TypeError, ValueError):
+        return 5
 
 
 def safe_call(func, *args, **kwargs):
@@ -20,11 +36,7 @@ def safe_call(func, *args, **kwargs):
             return func(*args, **kwargs)
         except SpotifyException as e:
             if e.http_status == 429:
-                headers = getattr(e, "headers", None) or {}
-                try:
-                    retry_after = int(headers.get("Retry-After", 5))
-                except (TypeError, ValueError):
-                    retry_after = 5
+                retry_after = _retry_after_seconds(e)
                 if retry_after > MAX_WAIT_SECONDS:
                     log_event(
                         "sync_artists",
@@ -36,11 +48,8 @@ def safe_call(func, *args, **kwargs):
                 retries += 1
                 log_event("sync_artists", f"Rate limit hit. Retry #{retries} in {retry_after}s")
                 time.sleep(retry_after)
-            elif e.http_status == 403:
-                # Este artista no está disponible para la app; se omite y se sigue con los demás
-                raise
             else:
-                log_event("sync_artists", f"Spotify error: {e}", level="error")
+                # 403 u otros errores: se lanzan para que el llamador omita este artista
                 raise
         except requests.exceptions.ConnectionError as e:
             retries += 1
