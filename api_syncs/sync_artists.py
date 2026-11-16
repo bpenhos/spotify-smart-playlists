@@ -10,8 +10,10 @@ from utils.db_utils import get_db_connection
 # Cliente sin reintentos internos de spotipy: si Spotify pide esperar,
 # el error sale de inmediato en vez de dormir el proceso horas.
 _base_client = get_spotify_client()
+auth_manager = _base_client.auth_manager
+
 sp = Spotify(
-    auth_manager=_base_client.auth_manager,
+    auth_manager=auth_manager,
     retries=0,
     status_retries=0,
     requests_timeout=15,
@@ -29,12 +31,27 @@ def _retry_after_seconds(e):
         return 5
 
 
+def _refresh_token():
+    # Fuerza una renovación del access token ignorando el caché
+    try:
+        auth_manager.get_access_token(check_cache=False)
+        log_event("sync_artists", "Access token renovado.")
+    except Exception as e:
+        log_event("sync_artists", f"No se pudo renovar el token: {e}", level="error")
+        raise
+
+
 def safe_call(func, *args, **kwargs):
     retries = 0
+    refreshed = False
     while retries < 5:
         try:
             return func(*args, **kwargs)
         except SpotifyException as e:
+            if e.http_status == 401 and not refreshed:
+                refreshed = True
+                _refresh_token()
+                continue
             if e.http_status == 429:
                 retry_after = _retry_after_seconds(e)
                 if retry_after > MAX_WAIT_SECONDS:
