@@ -1,26 +1,41 @@
+import os
 import sys
 import time
+import base64
+import requests
 import requests.exceptions
 from spotipy import Spotify
 from spotipy.exceptions import SpotifyException
 from utils.logger import log_event
-from utils.spotify_auth import get_spotify_client
 from utils.db_utils import get_db_connection
 
-# Cliente sin reintentos internos de spotipy: si Spotify pide esperar,
-# el error sale de inmediato en vez de dormir el proceso horas.
-_base_client = get_spotify_client()
-auth_manager = _base_client.auth_manager
-
-sp = Spotify(
-    auth_manager=auth_manager,
-    retries=0,
-    status_retries=0,
-    requests_timeout=15,
-)
+CLIENT_ID = os.environ["SPOTIFY_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SPOTIFY_CLIENT_SECRET"]
+REFRESH_TOKEN = os.environ["SPOTIFY_REFRESH_TOKEN"]
 
 # Si Spotify pide esperar más de este número de segundos, la ejecución se detiene limpiamente.
 MAX_WAIT_SECONDS = 120
+
+
+def fetch_access_token():
+    """Pide un access token nuevo usando el refresh token."""
+    basic = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+    r = requests.post(
+        "https://accounts.spotify.com/api/token",
+        headers={"Authorization": f"Basic {basic}"},
+        data={"grant_type": "refresh_token", "refresh_token": REFRESH_TOKEN},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def new_client():
+    # Sin reintentos internos de spotipy: si Spotify pide esperar, el error sale de inmediato.
+    return Spotify(auth=fetch_access_token(), retries=0, status_retries=0, requests_timeout=15)
+
+
+sp = new_client()
 
 
 def _retry_after_seconds(e):
@@ -31,26 +46,18 @@ def _retry_after_seconds(e):
         return 5
 
 
-def _refresh_token():
-    # Fuerza una renovación del access token ignorando el caché
-    try:
-        auth_manager.get_access_token(check_cache=False)
-        log_event("sync_artists", "Access token renovado.")
-    except Exception as e:
-        log_event("sync_artists", f"No se pudo renovar el token: {e}", level="error")
-        raise
-
-
-def safe_call(func, *args, **kwargs):
+def fetch_artist(artist_id):
+    global sp
     retries = 0
     refreshed = False
-    while retries < 5:
+    while True:
         try:
-            return func(*args, **kwargs)
+            return sp.artist(artist_id)
         except SpotifyException as e:
             if e.http_status == 401 and not refreshed:
                 refreshed = True
-                _refresh_token()
+                log_event("sync_artists", "Token expirado. Renovando access token.")
+                sp = new_client()
                 continue
             if e.http_status == 429:
                 retry_after = _retry_after_seconds(e)
@@ -63,16 +70,19 @@ def safe_call(func, *args, **kwargs):
                     )
                     sys.exit(0)
                 retries += 1
+                if retries > 5:
+                    raise
                 log_event("sync_artists", f"Rate limit hit. Retry #{retries} in {retry_after}s")
                 time.sleep(retry_after)
-            else:
-                # 403 u otros errores: se lanzan para que el llamador omita este artista
-                raise
+                continue
+            # 403 u otros: el llamador omite este artista
+            raise
         except requests.exceptions.ConnectionError as e:
             retries += 1
+            if retries > 5:
+                raise
             log_event("sync_artists", f"Connection error: {e}. Retry #{retries} in 5s", level="warning")
             time.sleep(5)
-    raise Exception("safe_call failed after 5 retries")
 
 
 conn = get_db_connection()
@@ -97,7 +107,7 @@ skipped = 0
 
 for artist_id in artist_ids:
     try:
-        data = safe_call(sp.artist, artist_id)
+        data = fetch_artist(artist_id)
     except SpotifyException as e:
         skipped += 1
         log_event("sync_artists", f"Omitido {artist_id} (HTTP {e.http_status})", level="warning")
