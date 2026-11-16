@@ -1,4 +1,5 @@
 import os
+import sys
 import psycopg2
 import requests
 import time
@@ -9,12 +10,36 @@ from utils.logger import log_event
 from utils.spotify_auth import get_spotify_client
 from utils.db_utils import get_db_connection
 
-sp = get_spotify_client()
-# How many albums to integrity-check per run (can override via env ALBUM_INTEGRITY_BATCH)
-INTEGRITY_CHECK_COUNT = int(os.getenv("ALBUM_INTEGRITY_BATCH", "50"))
+# Cliente base (con refresh automático del token)
+_base_client = get_spotify_client()
 
-# Si Spotify bloquea el endpoint de popularidad (403), se desactiva para no repetir el error
-_popularity_disabled = False
+# Cliente sin reintentos automáticos: si Spotify pide esperar, la excepción sale de inmediato
+# en vez de dormir el proceso durante horas.
+sp = Spotify(
+    auth_manager=_base_client.auth_manager,
+    retries=0,
+    status_retries=0,
+    requests_timeout=15,
+)
+
+# Verificación de integridad desactivada por defecto para reducir llamadas (puedes subirla con la variable ALBUM_INTEGRITY_BATCH)
+INTEGRITY_CHECK_COUNT = int(os.getenv("ALBUM_INTEGRITY_BATCH", "0"))
+
+# Popularidad desactivada: Spotify bloquea este endpoint en apps en modo Development (403)
+_popularity_disabled = True
+
+# Si Spotify pide esperar más de este número de segundos, se detiene la ejecución limpiamente.
+# El progreso ya guardado se conserva y la siguiente ejecución continúa desde donde quedó.
+MAX_WAIT_SECONDS = 120
+
+
+def _retry_after_seconds(e):
+    headers = getattr(e, "headers", None) or {}
+    try:
+        return int(headers.get("Retry-After", 5))
+    except (TypeError, ValueError):
+        return 5
+
 
 def safe_spotify_call(func, *args, **kwargs):
     retries = 0
@@ -23,7 +48,15 @@ def safe_spotify_call(func, *args, **kwargs):
             return func(*args, **kwargs)
         except SpotifyException as e:
             if e.http_status == 429:
-                retry_after = int(e.headers.get("Retry-After", 5))
+                retry_after = _retry_after_seconds(e)
+                if retry_after > MAX_WAIT_SECONDS:
+                    log_event(
+                        "sync_album_tracks",
+                        f"Spotify rate limit: esperar {retry_after}s es demasiado. "
+                        "Se detiene esta ejecución; la siguiente continuará desde donde quedó.",
+                        level="warning",
+                    )
+                    sys.exit(0)
                 retries += 1
                 log_event("sync_album_tracks", f"Rate limit hit. Retry #{retries} in {retry_after}s")
                 time.sleep(retry_after)
@@ -51,8 +84,7 @@ def get_all_album_tracks(album_id):
     return tracks
 
 
-# Helper to get popularity by track id. If Spotify returns 403, popularity is skipped
-# and the rest of the sync continues normally.
+# Helper to get popularity by track id. Disabled by default (see _popularity_disabled).
 def get_popularity_map(track_ids):
     global _popularity_disabled
     popularity = {}
@@ -183,88 +215,83 @@ for album_id, in removed_albums:
     cur.execute("DELETE FROM albums WHERE id = %s", (album_id,))
     conn.commit()
 
-# 3️⃣ Background integrity check: verify oldest N albums each run (N=INTEGRITY_CHECK_COUNT)
-log_event("sync_album_tracks", f"Running background integrity check for oldest {INTEGRITY_CHECK_COUNT} albums")
+# 3️⃣ Background integrity check (desactivada si ALBUM_INTEGRITY_BATCH = 0)
+if INTEGRITY_CHECK_COUNT > 0:
+    log_event("sync_album_tracks", f"Running background integrity check for oldest {INTEGRITY_CHECK_COUNT} albums")
 
-cur.execute("""
-    SELECT id, name, added_at
-    FROM albums
-    WHERE is_saved = TRUE
-    ORDER BY tracks_checked_at NULLS FIRST, added_at ASC
-    LIMIT %s
-""", (INTEGRITY_CHECK_COUNT,))
-oldest_albums = cur.fetchall()
+    cur.execute("""
+        SELECT id, name, added_at
+        FROM albums
+        WHERE is_saved = TRUE
+        ORDER BY tracks_checked_at NULLS FIRST, added_at ASC
+        LIMIT %s
+    """, (INTEGRITY_CHECK_COUNT,))
+    oldest_albums = cur.fetchall()
 
-for chk_album_id, chk_album_name, chk_album_added_at in oldest_albums:
-    try:
-        log_event("sync_album_tracks", f"Integrity check: {chk_album_name} ({chk_album_id})")
-        album_tracks = get_all_album_tracks(chk_album_id)
-        if not album_tracks:
-            log_event("sync_album_tracks", f"No tracks returned during integrity check for album: {chk_album_name} ({chk_album_id})", level="warning")
-            # Still record check to avoid hammering the same album
-            cur.execute("UPDATE albums SET tracks_checked_at = NOW() WHERE id = %s", (chk_album_id,))
-            conn.commit()
-            continue
-
-        # Enrich with popularity (skipped automatically if Spotify forbids it)
-        sp_track_ids = [t.get('id') for t in album_tracks if t.get('id')]
-        enriched = get_popularity_map(sp_track_ids)
-
-        # Upsert tracks + popularity; do not delete missing here
-        for t in album_tracks:
-            tid = t.get('id')
-            if not tid:
+    for chk_album_id, chk_album_name, chk_album_added_at in oldest_albums:
+        try:
+            log_event("sync_album_tracks", f"Integrity check: {chk_album_name} ({chk_album_id})")
+            album_tracks = get_all_album_tracks(chk_album_id)
+            if not album_tracks:
+                log_event("sync_album_tracks", f"No tracks returned during integrity check for album: {chk_album_name} ({chk_album_id})", level="warning")
+                cur.execute("UPDATE albums SET tracks_checked_at = NOW() WHERE id = %s", (chk_album_id,))
+                conn.commit()
                 continue
-            t_name = t.get('name')
-            t_artist = t.get('artists', [{}])[0].get('name')
-            t_num = t.get('track_number') or 1
-            d_num = t.get('disc_number') or 1
-            dur = t.get('duration_ms')
-            pop = enriched.get(tid)
 
-            cur.execute("""
-                INSERT INTO tracks (
-                    id, name, artist, album, album_id,
-                    from_album, track_number, disc_number, added_at,
-                    duration_ms, popularity
-                )
-                VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s,
-                        %s, %s)
-                ON CONFLICT (id) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    artist = EXCLUDED.artist,
-                    album = EXCLUDED.album,
-                    album_id = EXCLUDED.album_id,
-                    from_album = TRUE,
-                    track_number = EXCLUDED.track_number,
-                    disc_number = EXCLUDED.disc_number,
-                    duration_ms = EXCLUDED.duration_ms,
-                    popularity = COALESCE(EXCLUDED.popularity, tracks.popularity)
-            """, (tid, t_name, t_artist, chk_album_name, chk_album_id, t_num, d_num, chk_album_added_at, dur, pop))
+            sp_track_ids = [t.get('id') for t in album_tracks if t.get('id')]
+            enriched = get_popularity_map(sp_track_ids)
 
-        # --- Reconcile: remove DB tracks that no longer exist on Spotify for this album (integrity check) ---
-        cur.execute("SELECT id FROM tracks WHERE album_id = %s AND from_album = TRUE", (chk_album_id,))
-        existing_ids = {row[0] for row in cur.fetchall()}
-        desired_ids = {t['id'] for t in album_tracks if t.get('id')}
-        to_remove = list(existing_ids - desired_ids)
+            for t in album_tracks:
+                tid = t.get('id')
+                if not tid:
+                    continue
+                t_name = t.get('name')
+                t_artist = t.get('artists', [{}])[0].get('name')
+                t_num = t.get('track_number') or 1
+                d_num = t.get('disc_number') or 1
+                dur = t.get('duration_ms')
+                pop = enriched.get(tid)
 
-        if to_remove:
-            cur.execute("DELETE FROM liked_tracks WHERE track_id = ANY(%s)", (to_remove,))
-            cur.execute("DELETE FROM tracks WHERE id = ANY(%s) AND album_id = %s", (to_remove, chk_album_id))
-            log_event("sync_album_tracks", f"Integrity reconcile {chk_album_id}: removed {len(to_remove)} track(s) not present on Spotify")
+                cur.execute("""
+                    INSERT INTO tracks (
+                        id, name, artist, album, album_id,
+                        from_album, track_number, disc_number, added_at,
+                        duration_ms, popularity
+                    )
+                    VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s,
+                            %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        artist = EXCLUDED.artist,
+                        album = EXCLUDED.album,
+                        album_id = EXCLUDED.album_id,
+                        from_album = TRUE,
+                        track_number = EXCLUDED.track_number,
+                        disc_number = EXCLUDED.disc_number,
+                        duration_ms = EXCLUDED.duration_ms,
+                        popularity = COALESCE(EXCLUDED.popularity, tracks.popularity)
+                """, (tid, t_name, t_artist, chk_album_name, chk_album_id, t_num, d_num, chk_album_added_at, dur, pop))
 
-        # Mark album as checked
-        cur.execute("UPDATE albums SET tracks_checked_at = NOW() WHERE id = %s", (chk_album_id,))
-        updated = cur.rowcount
-        log_event("sync_album_tracks", f"Stamped tracks_checked_at for {chk_album_id}; rows updated: {updated}")
-        if updated == 0:
-            # Re-attempt with explicit type cast (rare, but helpful if id encoding mismatch)
-            cur.execute("UPDATE albums SET tracks_checked_at = NOW() WHERE id::text = %s::text", (chk_album_id,))
-            log_event("sync_album_tracks", f"Re-attempted stamp for {chk_album_id}; rows updated: {cur.rowcount}")
-        conn.commit()
-    except Exception as e:
-        log_event("sync_album_tracks", f"Integrity check failed for album {chk_album_id}: {e}", level="error")
-        conn.rollback()
+            cur.execute("SELECT id FROM tracks WHERE album_id = %s AND from_album = TRUE", (chk_album_id,))
+            existing_ids = {row[0] for row in cur.fetchall()}
+            desired_ids = {t['id'] for t in album_tracks if t.get('id')}
+            to_remove = list(existing_ids - desired_ids)
+
+            if to_remove:
+                cur.execute("DELETE FROM liked_tracks WHERE track_id = ANY(%s)", (to_remove,))
+                cur.execute("DELETE FROM tracks WHERE id = ANY(%s) AND album_id = %s", (to_remove, chk_album_id))
+                log_event("sync_album_tracks", f"Integrity reconcile {chk_album_id}: removed {len(to_remove)} track(s) not present on Spotify")
+
+            cur.execute("UPDATE albums SET tracks_checked_at = NOW() WHERE id = %s", (chk_album_id,))
+            updated = cur.rowcount
+            log_event("sync_album_tracks", f"Stamped tracks_checked_at for {chk_album_id}; rows updated: {updated}")
+            if updated == 0:
+                cur.execute("UPDATE albums SET tracks_checked_at = NOW() WHERE id::text = %s::text", (chk_album_id,))
+                log_event("sync_album_tracks", f"Re-attempted stamp for {chk_album_id}; rows updated: {cur.rowcount}")
+            conn.commit()
+        except Exception as e:
+            log_event("sync_album_tracks", f"Integrity check failed for album {chk_album_id}: {e}", level="error")
+            conn.rollback()
 
 conn.commit()
 
