@@ -13,6 +13,9 @@ sp = get_spotify_client()
 # How many albums to integrity-check per run (can override via env ALBUM_INTEGRITY_BATCH)
 INTEGRITY_CHECK_COUNT = int(os.getenv("ALBUM_INTEGRITY_BATCH", "50"))
 
+# Si Spotify bloquea el endpoint de popularidad (403), se desactiva para no repetir el error
+_popularity_disabled = False
+
 def safe_spotify_call(func, *args, **kwargs):
     retries = 0
     while retries < 5:
@@ -47,6 +50,32 @@ def get_all_album_tracks(album_id):
 
     return tracks
 
+
+# Helper to get popularity by track id. If Spotify returns 403, popularity is skipped
+# and the rest of the sync continues normally.
+def get_popularity_map(track_ids):
+    global _popularity_disabled
+    popularity = {}
+    if _popularity_disabled or not track_ids:
+        return popularity
+
+    for i in range(0, len(track_ids), 50):
+        batch_ids = track_ids[i:i+50]
+        try:
+            response = safe_spotify_call(sp.tracks, batch_ids)
+        except SpotifyException as e:
+            if e.http_status == 403:
+                log_event("sync_album_tracks", "Popularity endpoint forbidden (403). Skipping popularity for this run.", level="warning")
+                _popularity_disabled = True
+                break
+            raise
+        for item in (response or {}).get('tracks', []) or []:
+            if item and item.get('id'):
+                popularity[item['id']] = item.get('popularity')
+
+    return popularity
+
+
 conn = get_db_connection()
 cur = conn.cursor()
 # Safety: ensure columns exist (no-op if already present)
@@ -72,12 +101,7 @@ for album_id, album_name, album_added_at in saved_albums:
         continue
 
     track_ids = [t['id'] for t in album_tracks if t.get('id')]
-    enriched_metadata = {}
-    for i in range(0, len(track_ids), 50):
-        batch_ids = track_ids[i:i+50]
-        response = safe_spotify_call(sp.tracks, batch_ids)
-        for item in response.get('tracks', []):
-            enriched_metadata[item['id']] = item
+    enriched_popularity = get_popularity_map(track_ids)
 
     for track in album_tracks:
         track_id = track['id']
@@ -87,10 +111,7 @@ for album_id, album_name, album_added_at in saved_albums:
         disc_number = track.get('disc_number') or 1
 
         duration_ms = track.get('duration_ms')
-
-        popularity = None
-        if track_id and track_id in enriched_metadata:
-            popularity = enriched_metadata[track_id].get('popularity')
+        popularity = enriched_popularity.get(track_id) if track_id else None
 
         cur.execute("""
             INSERT INTO tracks (
@@ -185,14 +206,9 @@ for chk_album_id, chk_album_name, chk_album_added_at in oldest_albums:
             conn.commit()
             continue
 
-        # Enrich with popularity
+        # Enrich with popularity (skipped automatically if Spotify forbids it)
         sp_track_ids = [t.get('id') for t in album_tracks if t.get('id')]
-        enriched = {}
-        for i in range(0, len(sp_track_ids), 50):
-            batch_ids = sp_track_ids[i:i+50]
-            response = safe_spotify_call(sp.tracks, batch_ids)
-            for item in response.get('tracks', []):
-                enriched[item['id']] = item
+        enriched = get_popularity_map(sp_track_ids)
 
         # Upsert tracks + popularity; do not delete missing here
         for t in album_tracks:
@@ -204,7 +220,7 @@ for chk_album_id, chk_album_name, chk_album_added_at in oldest_albums:
             t_num = t.get('track_number') or 1
             d_num = t.get('disc_number') or 1
             dur = t.get('duration_ms')
-            pop = enriched.get(tid, {}).get('popularity')
+            pop = enriched.get(tid)
 
             cur.execute("""
                 INSERT INTO tracks (
